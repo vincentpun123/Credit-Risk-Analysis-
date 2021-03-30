@@ -1,0 +1,1031 @@
+#SETUP----
+
+library(farff) # for reading arff file
+library(cvTools) # explicit creation of folds for cross-validation
+library(ModelMetrics) # used for precision-recall evaluation of classifiers
+library(car) # for recode function
+
+
+# optimal cutoff for predicting bad credit set as
+# (cost of false negative/cost of false positive) times
+# (prevalence of positive/prevalence of negative)
+
+#CUTOFF CLASSIFICATION AND COST MATRIX----
+# (1/5)*(.3/.7) = 0.086
+CUTOFF = 0.086 #Cutoff Classification 
+COSTMATRIX = matrix(c(0,5,1,0), nrow = 2, ncol = 2, byrow = TRUE) #Cost Matrix 
+
+#CREDIT ARFF DATASET----
+credit = readARFF("dataset_31_credit-g.arff")
+
+# write to comma-delimited text for review in Excel
+write.csv(credit, file = "credit.csv", row.names = FALSE)
+
+# check structure of the data frame
+cat("\n\nStucture of initial credit data frame:\n")
+print(str(credit))
+
+# quick summary of credit data
+cat("\n\nSummary of initial credit data frame:\n")
+print(summary(credit))
+
+#DATA PREPARATION ----
+
+# personal_status has level "female single" with no observations
+cat("\n\nProblems with personal_status, no single females:\n")
+print(table(credit$personal_status))
+
+# fix this prior to analysis
+#level 5 (female single) has NO OBSERVATIONS in this study, so REMOVE 
+credit$personal_status = factor(as.numeric(credit$personal_status),
+    levels = c(1,2,3,4), 
+    labels = c("male div/sep","female div/dep/mar","male single","male mar/wid"))
+
+#Purpose, low and no end frequency levels
+cat("\n\nProblems with purpose, low- and no-frequency levels:\n")
+print(table(credit$purpose))
+# keep first four classes: "new car", "used car", "furniture/equipment", "radio/tv"
+#Classes with low frequency, collapse these into the "other" classificaiton
+# keep "education" and "business" with new values 
+# add "retraining" to "education"
+# gather all other levels into "other"
+credit$purpose = recode(credit$purpose, '"new car" = "new car";
+    "used car" = "used car"; 
+    "furniture/equipment" = "furniture/equipment";
+    "radio/tv" = "radio/tv"; 
+    "education" = "education"; "retraining" = "education";
+    "business" = "business"; 
+    "domestic appliance" = "other"; "repairs" = "other"; "vacation" = "other"; 
+    "other" = "other" ',
+    levels = c("new car","used car","furniture/equipment","radio/tv", 
+    "education","business","other" ))
+
+# credit_amount is highly skewed... use log_credit_amount instead
+credit$log_credit_amount = log(credit$credit_amount)    
+
+#PARAMETERS ----
+
+par(mfrow = c(2,3))
+
+
+#######----ORIGINAL DATA----#########
+#histogram
+hist(credit$credit_amount,
+     main = "Histogram - credit_amount",
+     xlab = "(Original Data)",
+     col = "steelblue")
+
+#qqplot 
+qqnorm(credit$credit_amount,
+       col = ifelse(credit$credit_amount %in% 
+                      c(boxplot.stats(credit$credit_amount)$out), #red for outliers
+                    "red","black"),
+       xlab = "(Original Data)")
+
+qqline(credit$credit_amount)
+
+#boxplot
+boxplot(credit$credit_amount,
+        main = "Boxplot - credit_amount",
+        ylab = "Meters",
+        xlab = "(Original Data)")
+
+#######----NO OUTLIERS----#########
+
+#histogram
+hist(credit$log_credit_amount,
+     main = "Histogram - credit_amount",
+     xlab = "(Removed Outliers)",
+     col = "steelblue")
+
+#qqplot 
+qqnorm(credit$log_credit_amount,
+       col = ifelse(credit$log_credit_amount %in% 
+                      c(boxplot.stats(credit$log_credit_amount)$out), #red for outliers
+                    "red","black"),
+       xlab = "(Removed Outliers)")
+
+qqline(credit$log_credit_amount)
+
+#boxplot
+boxplot(credit$log_credit_amount,
+        main = "Boxplot - credit_amount",
+        ylab = "Meters",
+        xlab = "(Removed Outliers)")
+
+
+#Purpose, low and no end frequency levels
+cat("\n\nProblems with purpose, low- and no-frequency levels:\n")
+print(table(credit$purpose))
+# keep first four classes: "new car", "used car", "furniture/equipment", "radio/tv"
+#Classes with low frequency, collapse these into the "other" classificaiton
+# keep "education" and "business" with new values 
+# add "retraining" to "education"
+# gather all other levels into "other"
+credit$purpose = recode(credit$purpose, '"new car" = "new car";
+    "used car" = "used car"; 
+    "furniture/equipment" = "furniture/equipment";
+    "radio/tv" = "radio/tv"; 
+    "education" = "education"; "retraining" = "education";
+    "business" = "business"; 
+    "domestic appliance" = "other"; "repairs" = "other"; "vacation" = "other"; 
+    "other" = "other" ',
+    levels = c("new car","used car","furniture/equipment","radio/tv", 
+    "education","business","other" ))
+
+# summary of transformed credit data----
+cat("\n\nSummary of revised credit data frame:\n")
+print(summary(credit))
+
+# logistic regression evaluated with cross-validation----
+
+# include explanatory variables except foreign_worker
+# (only 37 of 100 cases are foreign workers)
+credit_model = "class ~ checking_status + duration + 
+    credit_history + purpose + log_credit_amount + savings_status + 
+    employment + installment_commitment + personal_status +        
+    other_parties + residence_since + property_magnitude +
+    age + other_payment_plans + housing + existing_credits +      
+    job + num_dependents + own_telephone" 
+
+#cross validation folds, 5 fold cross validation
+set.seed(1)
+nfolds = 5
+folds = cvFolds(nrow(credit), K = nfolds) # creates list of indices
+
+#compute precision, recall, f1 score, and cost ----
+#BASE (0 cutoff)
+baseprecision = rep(0, nfolds)  # precision with 0 cutoff
+baserecall = rep(0, nfolds)  # recall with  0 cutoff
+basef1Score = rep(0, nfolds)  # f1Score with 0 cutoff
+basecost = rep(0, nfolds)  # total cost with 0 cutoff
+
+#CUTOFF
+ruleprecision = rep(0, nfolds)  # precision with CUTOFF rule
+rulerecall = rep(0, nfolds)  # recall with CUTOFF rule
+rulef1Score = rep(0, nfolds)  # f1Score with CUTOFF rule
+rulecost = rep(0, nfolds)  # total cost with CUTOFF rule
+
+#looping, each fold, compute statistics for evaluating accuracy of cross validation and evaluate costs 
+for (ifold in seq(nfolds)) {
+    # cat("\n\nSUMMARY FOR IFOLD:", ifold) # checking in development
+    # print(summary(credit[(folds$which == ifold),]))
+  
+    # train model on all folds except ifold
+    train = credit[(folds$which != ifold), ]
+    
+    #test
+    test = credit[(folds$which == ifold),]
+    
+    #logistic model
+    credit_fit = glm(credit_model, family = binomial,
+        data = train)
+    
+    # evaluate on fold ifold    
+    # predict on test 
+    credit_predict = predict.glm(credit_fit, 
+        newdata = test, type = "response") 
+    
+    #BASE 
+    #CUTOFF = 0.5 
+    #precision, recall, f1score, confusion matrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    baseprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5)  
+    baserecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1,
+        credit_predict) * COSTMATRIX)  
+    
+    #CUTOFF
+    #precision, recall, f1Score, confusionMatrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    ruleprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)  
+    rulerecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF) 
+    rulef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)
+    rulecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1, 
+            credit_predict,cutoff=CUTOFF) * COSTMATRIX)                                    
+} 
+
+#cvbaseline----
+#collect values
+cvbaseline = data.frame(baseprecision, baserecall, basef1Score, basecost,
+                        ruleprecision, rulerecall, rulef1Score, rulecost)
+
+cat("\n\nCross-validation summary across folds:\n")
+print(round(cvbaseline, digits = 3))
+
+cat("\n\nCross-validation baseline results under STANDARD cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline$basef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline$basecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline$baseprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline$baserecall), digits = 2), "\n")
+
+cat("\n\nCross-validation baseline results under cost cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline$rulef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline$rulecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline$ruleprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline$rulerecall), digits = 2), "\n")
+
+# prepare data for input to autoencoder work
+#make it into a matrix so that dummy variables become binary
+design_matrix = model.matrix(as.formula(credit_model), data = credit)
+design_data_frame = as.data.frame(design_matrix)[,-1]  # dropping the intercept term
+
+# normalize the data ----
+minmaxnorm <- function(x) { return ((x - min(x)) / (max(x) - min(x))) }
+
+
+#minmax_data_frame
+minmax_data_frame <- as.data.frame(lapply(design_data_frame, FUN = minmaxnorm)) #as.data.frame (CHANGE)
+
+cat("\n\nStructure of minmax_data_frame for input to autoencoding work:\n")
+print(str(minmax_data_frame))
+
+dim(credit) #1000 x 22
+dim(design_data_frame) #1000 x 44 
+dim(minmax_data_frame)#1000 x 44 
+
+# Autoencoder
+###########################
+# Resources
+###########################
+# https://blogs.rstudio.com/tensorflow/posts/2018-01-24-keras-fraud-autoencoder/ (Links to an external site.)
+
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(ggridges)
+library(keras)
+library(pROC)
+
+library(reshape2)
+
+###########################
+# Helper functions
+###########################
+
+# normalize using the min-max method
+normalize <- function(x) {
+  denom <- ifelse(max(x) - min(x) == 0, 1, max(x) - min(x))
+  return ((x - min(x)) / denom)
+}
+
+
+###########################
+# Exploratory Data Analysis
+# Data Prep
+###########################
+
+credit %>%
+        gather(variable, value, -class) %>%
+        ggplot(aes(y = as.factor(variable),
+                   fill = as.factor(class),
+                   x = percent_rank(value)))+
+        geom_density_ridges(scale = 1) +
+        labs(fill = 'class', y = 'Variables', x = '')
+
+
+# Review range of variables and ensure no N/As exist
+summary(minmax_data_frame)
+
+# Check to see if dataset is balanced
+#700 to 300 
+credit %>%
+        group_by(class) %>%
+        summarize(Count = n())
+
+
+###########################
+# Split the dataset
+###########################
+
+## set the seed to make your partition reproducible
+set.seed(123)
+
+#sample size
+smp_size <- floor(0.80 * nrow(minmax_data_frame))
+
+train_ind <- sample(seq_len(nrow(minmax_data_frame)), size = smp_size)
+
+#df_train and df_test
+df_train <- minmax_data_frame[train_ind, ]
+df_test <- minmax_data_frame[-train_ind, ]
+
+#y_train and y_test
+y_train <- credit$class[train_ind]
+y_test <- credit$class[-train_ind]
+
+# Create the training matrix
+x_train <- df_train %>%
+  as.matrix()
+
+# Create the testing matrix
+x_test <- df_test %>%
+  as.matrix()
+
+###########################
+# MODEL 1 - AUTOENCODER
+###########################
+
+###########################
+# Construct and compile the autoencoder
+###########################
+
+# Create a sequential model
+model <- keras_model_sequential()
+model %>%
+  # encoder
+  layer_dense(units = 15, activation = "tanh", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 10, activation = "tanh") %>%
+  # decoder
+  layer_dense(units = 15, activation = "tanh") %>%
+  layer_dense(units = ncol(x_train)
+)
+
+# Compile the modelminmax_data_frame
+model %>% compile(
+  loss='mean_squared_error',
+  optimizer='adam',
+  metrics = c('accuracy')
+)
+
+# View the model summary
+summary(model)
+
+###########################
+# MODEL 2 - AUTOENCODER
+###########################
+
+###########################
+# Construct and compile the autoencoder
+###########################
+
+# Create a sequential model
+model2 <- keras_model_sequential()
+model2 %>%
+  # encoder
+  layer_dense(units = 30, activation = "tanh", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 20, activation = "tanh") %>%
+  layer_dense(units = 10, activation = "tanh") %>%
+  # decoder
+  layer_dense(units = 20, activation = "tanh") %>%
+  layer_dense(units = 30, activation = "tanh") %>%
+  layer_dense(units = ncol(x_train)
+)
+
+# Compile the model
+model2 %>% compile(
+  loss='binary_crossentropy',
+  optimizer='adam',
+  metrics = c('accuracy')
+)
+
+# View the model summary
+summary(model2)
+
+# Create a sequential model
+model2b <- keras_model_sequential()
+model2b %>%
+  # encoder
+  layer_dense(units = 30, activation = "tanh", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 20, activation = "tanh") %>%
+  layer_dense(units = 10, activation = "tanh") %>%
+  # decoder
+  layer_dense(units = 20, activation = "tanh") %>%
+  layer_dense(units = 30, activation = "tanh") %>%
+  layer_dense(units = ncol(x_train)
+)
+
+# Compile the model
+model2b %>% compile(
+  loss='mean_squared_error',
+  optimizer='adam',
+  metrics = c('accuracy')
+)
+
+# View the model summary
+summary(model2b)
+
+###########################
+# MODEL 3 - AUTOENCODER
+###########################
+
+###########################
+# Construct and compile the autoencoder
+###########################
+
+# Create a sequential model
+model3 <- keras_model_sequential()
+model3 %>%
+  # encoder
+  layer_dense(units = 30, activation = "tanh", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 20, activation = "tanh") %>%
+  layer_dense(units = 10, activation = "tanh") %>%
+  # decoder
+  layer_dense(units = 20, activation = "tanh") %>%
+  layer_dense(units = 30, activation = "tanh") %>%
+  layer_dense(units = ncol(x_train)
+)
+
+# Compile the model
+model3 %>% compile(
+  loss='binary_crossentropy',
+  optimizer='adam',
+  metrics = c('accuracy')
+)
+
+# View the model summary
+summary(model3)
+
+
+###########################
+# Fit the model
+# Save the best model
+###########################
+
+# Save the best model
+checkpoint <- callback_model_checkpoint(
+  filepath = "model.hdf5",
+  save_best_only = TRUE,
+  period = 1,
+  verbose = 1
+)
+
+#
+checkpoint2 <- callback_model_checkpoint(
+  filepath = "model2.hdf5",
+  save_best_only = TRUE,
+  period = 1,
+  verbose = 1
+)
+
+#creating embedding input for logistic regression
+checkpoint2b <- callback_model_checkpoint(
+  filepath = "model2b.hdf5",
+  save_best_only = TRUE,
+  period = 1,
+  verbose = 1
+)
+
+checkpoint3 <- callback_model_checkpoint(
+  filepath = "model3.hdf5",
+  save_best_only = TRUE,
+  period = 1,
+  verbose = 1
+)
+
+# Stop training if val_loss stops decreasing
+early_stopping <- callback_early_stopping(monitor = 'val_loss', patience = 5)
+
+
+
+#0 = good
+#1 = bad
+y_train <- as.numeric(y_train)-1
+y_test <- as.numeric(y_test)-1
+
+# Train the model
+model %>% fit(
+  x = x_train,
+  y = x_train,
+  epochs = 100,
+  batch_size = 32,
+  validation_data = list(x_test, x_test),
+  callbacks = list(checkpoint, early_stopping)
+)
+
+
+# Check the loss
+loss <- evaluate(model, x = x_test[y_test == 0,], y = x_test[y_test == 0,])
+loss
+
+# Train the model ()
+model2 %>% fit(
+  x = x_train[y_train == 0,],
+  y = x_train[y_train == 0,],
+  epochs = 100,
+  batch_size = 32,
+  validation_data = list(x_test[y_test == 0,], x_test[y_test == 0,]),
+  callbacks = list(checkpoint2, early_stopping)
+)
+
+
+# Train the model
+model2b %>% fit(
+  x = x_train,
+  y = x_train,
+  epochs = 100,
+  batch_size = 32,
+  validation_data = list(x_test, x_test),
+  callbacks = list(checkpoint2b, early_stopping)
+)
+
+
+# Train the model
+model3 %>% fit(
+  x = x_train,
+  y = x_train,
+  epochs = 100,
+  batch_size = 32,
+  validation_data = list(x_test, x_test),
+  callbacks = list(checkpoint3, early_stopping)
+)
+
+
+###########################
+# Load the saved model
+# Calculate MSE
+###########################
+
+# Load the saved model
+model2 <- load_model_hdf5("model2.hdf5", compile = FALSE)
+
+# Reconstruct the training set and calculate MSE
+pred_train2 <- predict(model2, x_train)
+MSE_train2 <- apply((x_train - pred_train2) ^2, 1, sum)
+
+# Reconstruct the test set and calculate MSE
+pred_test2 <- predict(model2, x_test)
+MSE_test2 <- apply((x_test - pred_test2) ^2, 1, sum)
+
+###########################
+# AUC and ROC plots
+###########################
+
+# Calculate area under the curve and plot the ROC
+train_roc <- roc(y_train, MSE_train2)
+plot(train_roc, col = "blue", main = paste0("ROC - Training Set: AUC - ", round(train_roc$auc, 4)))
+
+# Calculate area under the curve and plot the ROC
+test_roc <- roc(y_test, MSE_test2)
+plot(test_roc, col = "blue", main = paste0("ROC - Test Set: AUC - ", round(test_roc$auc, 4)))
+
+
+###########################
+# Recall and precision
+###########################
+# Calculate the precision
+
+#MSE BETWEEN 0 AND 8
+possible_k <- seq(0,8, length.out = 100)
+
+precision <- sapply(possible_k, function(k) {
+    
+  predicted_class <- as.numeric(MSE_test2 > k)
+    
+  sum(predicted_class == 1 & y_test == 1)/sum(predicted_class)
+    
+})
+
+# Calculate the recall
+recall <- sapply(possible_k, function(k) {
+  predicted_class <- as.numeric(MSE_test2 > k)
+  sum(predicted_class == 1 & y_test == 1)/sum(y_test)
+})
+
+# Create dataset for plotting
+evaluation <- cbind(seq(1:100), precision, recall) %>%
+  as_tibble()
+colnames(evaluation) <- c('Threshold', 'Precision', 'Recall')
+evaluation <- melt(evaluation, id = 'Threshold')
+
+# Plot precision and recall
+ggplot() +
+  geom_line(data = evaluation, aes(x = Threshold, y = value, colour = variable)) +
+  labs(title = 'Precision / Recall')
+
+
+as.data.frame(y_test) %>%
+        group_by(y_test) %>%
+        summarize(Count = n())
+
+###########################
+# Fraudulent transactions
+###########################
+
+bc <- replicate(length(y_test), 0)
+bc[which(MSE_test2 >= 3.2)] <- 1
+
+# Create confusion matrix
+confusionMatrix(y_test, bc)
+sum(confusionMatrix(y_test,bc)*COSTMATRIX)
+
+
+combdata <- as.data.frame(cbind(y_test, MSE_test2))
+head(combdata, n = 5)
+
+
+paste(mean(combdata$MSE_test2[combdata$y_test == 0]))
+paste(mean(combdata$MSE_test2[combdata$y_test == 1]))
+
+
+ggplot(combdata, aes(x = MSE_test2, fill = as.factor(y_test)))+
+       geom_histogram(binwidth = 0.5, alpha = 0.5, position = "identity")
+
+
+#Autoencoder 1 - Generate Embedding----
+
+#The Combined Model, Generate Embedding
+minmax_data_frame_train <- minmax_data_frame %>%
+  as.matrix()
+
+pred_all <- predict(model, minmax_data_frame_train)
+
+pred_all <- as.data.frame(pred_all)
+
+#bind with credit class
+credit2 <- cbind(credit$class, pred_all)
+
+#change column name
+colnames(credit2)[1] <- c("class")
+
+names(credit2)
+head(credit2)
+dim(credit)
+dim(credit2)
+
+
+#Autoencoder 2 - Generate Embedding----
+
+pred_all2 <- predict(model2b, minmax_data_frame_train)
+
+pred_all2 <- as.data.frame(pred_all2)
+
+#bind with credit class
+credit3 <- cbind(credit$class, pred_all2)
+
+#change column name
+colnames(credit3)[1] <- c("class")
+
+names(credit3)
+head(credit3)
+dim(credit3)
+
+
+#Autoencoder 3 - Generate Embedding----
+
+pred_all3 <- predict(model3, minmax_data_frame_train)
+
+pred_all3 <- as.data.frame(pred_all3)
+
+#bind with credit class
+credit4 <- cbind(credit$class, pred_all3)
+
+#change column name
+colnames(credit4)[1] <- c("class")
+
+names(credit4)
+head(credit4)
+dim(credit4)
+
+
+#Autoencoder 1 - LR Model ----
+# logistic regression evaluated with cross-validation
+
+credit_model = "class ~ V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10
++ V11 + V12 + V13 + V14 + V15 + V16 + V17 + V18 + V19 + V20 + V21 + V22 + V23 + V24
++ V25 + V26 + V27 + V28 + V29 + V30 + V31 + V32 + V33 + V34 + V35 + V36 + V37 + V38 + V39
++ V40 + V41 + V42 + V43 + V44" 
+
+#cross validation folds, 5 fold cross validation
+set.seed(2)
+nfolds2 = 5
+folds2 = cvFolds(nrow(credit2), K = nfolds) # creates list of indices
+
+#compute precision, recall, f1 score, and cost ----
+#BASE (0 cutoff)
+baseprecision = rep(0, nfolds)  # precision with 0 cutoff
+baserecall = rep(0, nfolds)  # recall with  0 cutoff
+basef1Score = rep(0, nfolds)  # f1Score with 0 cutoff
+basecost = rep(0, nfolds)  # total cost with 0 cutoff
+
+#CUTOFF
+ruleprecision = rep(0, nfolds)  # precision with CUTOFF rule
+rulerecall = rep(0, nfolds)  # recall with CUTOFF rule
+rulef1Score = rep(0, nfolds)  # f1Score with CUTOFF rule
+rulecost = rep(0, nfolds)  # total cost with CUTOFF rule
+
+#looping, each fold, compute statistics for evaluating accuracy of cross validation and evaluate costs 
+for (ifold in seq(nfolds)) {
+    # cat("\n\nSUMMARY FOR IFOLD:", ifold) # checking in development
+    # print(summary(credit[(folds$which == ifold),]))
+  
+    # train model on all folds except ifold
+    train = credit2[(folds$which != ifold), ] #CREDIT2
+    
+    #test
+    test = credit2[(folds$which == ifold),] #CREDIT2
+    
+    #logistic model
+    credit_fit = glm(credit_model, family = binomial,
+        data = train)
+    
+    # evaluate on fold ifold    
+    # predict on test 
+    credit_predict = predict.glm(credit_fit, 
+        newdata = test, type = "response") 
+    
+    #cutoff is because logistic model will consider 
+    #BAD if > 0.5, GOOD < 0.5 in binomial model
+    
+    #(ModelMetrics library)
+    
+    #BASE 
+    
+    #CUTOFF = 0.5 
+    #precision, recall, f1score, confusion matrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    
+    baseprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5)  
+    baserecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1,
+        credit_predict) * COSTMATRIX)  
+    
+    #CUTOFF 
+    #precision, recall, f1Score, confusionMatrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    ruleprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)  
+    rulerecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF) 
+    rulef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)
+    rulecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1, 
+            credit_predict,cutoff=CUTOFF) * COSTMATRIX)                                    
+} 
+
+#cvbaseline----
+#collect values
+cvbaseline2 = data.frame(baseprecision, baserecall, basef1Score, basecost,
+                        ruleprecision, rulerecall, rulef1Score, rulecost)
+
+cat("\n\nCross-validation summary across folds:\n")
+print(round(cvbaseline2, digits = 3))
+
+#Autoencoder 1 - Summary----
+cat("\n\nCross-validation baseline results under STANDARD cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline2$basef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline2$basecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline2$baseprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline2$baserecall), digits = 2), "\n")
+
+cat("\n\nCross-validation baseline results under cost cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline2$rulef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline2$rulecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline2$ruleprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline2$rulerecall), digits = 2), "\n")
+
+
+#Autoencoder 2 - LR Model ----
+# logistic regression evaluated with cross-validation
+
+credit_model = "class ~ V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10
++ V11 + V12 + V13 + V14 + V15 + V16 + V17 + V18 + V19 + V20 + V21 + V22 + V23 + V24
++ V25 + V26 + V27 + V28 + V29 + V30 + V31 + V32 + V33 + V34 + V35 + V36 + V37 + V38 + V39
++ V40 + V41 + V42 + V43 + V44" 
+
+#cross validation folds, 5 fold cross validation
+set.seed(2)
+nfolds2 = 5
+folds2 = cvFolds(nrow(credit3), K = nfolds) # creates list of indices
+
+#compute precision, recall, f1 score, and cost ----
+#BASE (0 cutoff)
+baseprecision = rep(0, nfolds)  # precision with 0 cutoff
+baserecall = rep(0, nfolds)  # recall with  0 cutoff
+basef1Score = rep(0, nfolds)  # f1Score with 0 cutoff
+basecost = rep(0, nfolds)  # total cost with 0 cutoff
+
+#CUTOFF
+ruleprecision = rep(0, nfolds)  # precision with CUTOFF rule
+rulerecall = rep(0, nfolds)  # recall with CUTOFF rule
+rulef1Score = rep(0, nfolds)  # f1Score with CUTOFF rule
+rulecost = rep(0, nfolds)  # total cost with CUTOFF rule
+
+#looping, each fold, compute statistics for evaluating accuracy of cross validation and evaluate costs 
+for (ifold in seq(nfolds)) {
+    # cat("\n\nSUMMARY FOR IFOLD:", ifold) # checking in development
+    # print(summary(credit[(folds$which == ifold),]))
+  
+    # train model on all folds except ifold
+    train = credit3[(folds$which != ifold), ] #CREDIT2
+    
+    #test
+    test = credit3[(folds$which == ifold),] #CREDIT2
+    
+    #logistic model
+    credit_fit = glm(credit_model, family = binomial,
+        data = train)
+    
+    # evaluate on fold ifold    
+    # predict on test 
+    credit_predict = predict.glm(credit_fit, 
+        newdata = test, type = "response") 
+    
+    #cutoff is because logistic model will consider 
+    #BAD if > 0.5, GOOD < 0.5 in binomial model
+    
+    #(ModelMetrics library)
+    
+    #BASE 
+    
+    #CUTOFF = 0.5 
+    #precision, recall, f1score, confusion matrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    
+    baseprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5)  
+    baserecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1,
+        credit_predict) * COSTMATRIX)  
+    
+    #CUTOFF 
+    #precision, recall, f1Score, confusionMatrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    ruleprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)  
+    rulerecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF) 
+    rulef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)
+    rulecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1, 
+            credit_predict,cutoff=CUTOFF) * COSTMATRIX)                                    
+} 
+
+#cvbaseline----
+#collect values
+cvbaseline2 = data.frame(baseprecision, baserecall, basef1Score, basecost,
+                        ruleprecision, rulerecall, rulef1Score, rulecost)
+
+cat("\n\nCross-validation summary across folds:\n")
+print(round(cvbaseline2, digits = 3))
+
+#Autoencoder 1 - Summary----
+cat("\n\nCross-validation baseline results under STANDARD cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline2$basef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline2$basecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline2$baseprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline2$baserecall), digits = 2), "\n")
+
+cat("\n\nCross-validation baseline results under cost cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline2$rulef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline2$rulecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline2$ruleprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline2$rulerecall), digits = 2), "\n")
+
+
+#Autoencoder 3 - LR Model ----
+# logistic regression evaluated with cross-validation
+
+credit_model = "class ~ V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10
++ V11 + V12 + V13 + V14 + V15 + V16 + V17 + V18 + V19 + V20 + V21 + V22 + V23 + V24
++ V25 + V26 + V27 + V28 + V29 + V30 + V31 + V32 + V33 + V34 + V35 + V36 + V37 + V38 + V39
++ V40 + V41 + V42 + V43 + V44" 
+
+#cross validation folds, 5 fold cross validation
+set.seed(2)
+nfolds = 5
+folds = cvFolds(nrow(credit3), K = nfolds) # creates list of indices
+
+#compute precision, recall, f1 score, and cost ----
+#BASE (0 cutoff)
+baseprecision = rep(0, nfolds)  # precision with 0 cutoff
+baserecall = rep(0, nfolds)  # recall with  0 cutoff
+basef1Score = rep(0, nfolds)  # f1Score with 0 cutoff
+basecost = rep(0, nfolds)  # total cost with 0 cutoff
+
+#CUTOFF
+ruleprecision = rep(0, nfolds)  # precision with CUTOFF rule
+rulerecall = rep(0, nfolds)  # recall with CUTOFF rule
+rulef1Score = rep(0, nfolds)  # f1Score with CUTOFF rule
+rulecost = rep(0, nfolds)  # total cost with CUTOFF rule
+
+#looping, each fold, compute statistics for evaluating accuracy of cross validation and evaluate costs 
+for (ifold in seq(nfolds)) {
+    # cat("\n\nSUMMARY FOR IFOLD:", ifold) # checking in development
+    # print(summary(credit[(folds$which == ifold),]))
+  
+    # train model on all folds except ifold
+    train = credit4[(folds$which != ifold), ] #CREDIT4
+    
+    #test
+    test = credit4[(folds$which == ifold),] #CREDIT4
+    
+    #logistic model
+    credit_fit = glm(credit_model, family = binomial,
+        data = train)
+    
+    # evaluate on fold ifold    
+    # predict on test 
+    credit_predict = predict.glm(credit_fit, 
+        newdata = test, type = "response") 
+    
+    #cutoff is because logistic model will consider 
+    #BAD if > 0.5, GOOD < 0.5 in binomial model
+    
+    #(ModelMetrics library)
+    
+    #BASE 
+    
+    #CUTOFF = 0.5 
+    #precision, recall, f1score, confusion matrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    
+    baseprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5)  
+    baserecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = 0.5) 
+    basecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1,
+        credit_predict) * COSTMATRIX)  
+    
+    #CUTOFF 
+    #precision, recall, f1Score, confusionMatrix
+    #ppv = positive predictive value)
+    #subtract 1 because as.numeric changes good and bad to 1 and 2 respectively 
+    ruleprecision[ifold] = ppv(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)  
+    rulerecall[ifold] = recall(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF) 
+    rulef1Score[ifold] = f1Score(as.numeric(test$class)-1, 
+        credit_predict, cutoff = CUTOFF)
+    rulecost[ifold] = sum(
+        confusionMatrix(as.numeric(test$class)-1, 
+            credit_predict,cutoff=CUTOFF) * COSTMATRIX)                                    
+} 
+
+#cvbaseline----
+#collect values
+cvbaseline3 = data.frame(baseprecision, baserecall, basef1Score, basecost,
+                        ruleprecision, rulerecall, rulef1Score, rulecost)
+
+cat("\n\nCross-validation summary across folds:\n")
+print(round(cvbaseline3, digits = 3))
+
+#Autoencoder 1 - Summary----
+cat("\n\nCross-validation baseline results under STANDARD cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline3$basef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline3$basecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline3$baseprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline3$baserecall), digits = 2), "\n")
+
+cat("\n\nCross-validation baseline results under cost cutoff rules:")
+cat("\n    F1 Score: ", round(mean(cvbaseline3$rulef1Score), digits = 3))
+cat("\n    Average cost per fold: ", 
+    round(mean(cvbaseline3$rulecost), digits = 2), "\n")
+cat("\n    Average precision per fold: ", 
+    round(mean(cvbaseline3$ruleprecision), digits = 2), "\n")
+cat("\n    Average recall per fold: ", 
+    round(mean(cvbaseline3$rulerecall), digits = 2), "\n")
+
+
+
